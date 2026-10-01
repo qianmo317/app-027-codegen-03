@@ -1,11 +1,13 @@
 import { PATTERN_LIBRARY, fetchPatternText } from '@/data/patterns'
 import { defaultMaterials } from '@/data/materials'
 import { DEFAULT_CUT_SETTINGS, type CutSettings, type MaterialPreset, type Pt, type Shape } from './types'
+import type { CutStep } from './order'
 import { cleanupContours } from './cleanup'
 import { importSvgText } from './importer'
 import { computeShape } from './pipeline'
 import { buildJob } from './job'
-import { buildA4Sheet, computePlacement, exportGcode, exportPlt, type ExportMeta } from './exporters'
+import { buildA4Sheet, buildCalibSheet, computePlacement, exportGcode, exportPlt, identityPlacement, SHEET_MARGIN_MM, type ExportMeta } from './exporters'
+import { buildCalibGeometry, computeCalibration, profileStatus, upsertCalibration } from './calibration'
 import { polygonArea, polylineLength } from './geometry'
 
 export type CheckResult = {
@@ -450,6 +452,211 @@ export async function runSelfTest(settings: CutSettings = DEFAULT_CUT_SETTINGS, 
       '刀补超出轮廓尺度时明确警告并保留原路径（不输出坏路径）',
       !tinyOk && tinyMsg.includes('原路径') && tinyRuns > 0,
       `0.3mm 细长条（内层，向内侧偏置 ${mat.bladeOffsetMm}mm）：${tinyMsg}｜仍输出 ${tinyRuns} 段原路径`,
+    ),
+  )
+
+  // ---------- 10. 机器 × 纸张校准：试切件 / 反算 / 补偿摆放 / 档案留档 ----------
+  const calibSheet = { widthMm: 297, heightMm: 210, name: 'A4 横向' }
+  const cg = buildCalibGeometry(calibSheet)
+  // 试切线长度与几何断言
+  const hLine = cg.steps[0]
+  const vLine = cg.steps[1]
+  const hLen = Math.hypot(hLine.points[1].x - hLine.points[0].x, hLine.points[1].y - hLine.points[0].y)
+  const vLen = Math.hypot(vLine.points[1].x - vLine.points[0].x, vLine.points[1].y - vLine.points[0].y)
+  const corner = hLine.points[0]
+  // 内部坐标（左上原点）：角点 (margin, H−margin)；PLT 翻转后物理角点 (margin, margin)
+  const geomOk =
+    Math.abs(hLen - cg.stdXMm) < 1e-9 &&
+    Math.abs(vLen - cg.stdYMm) < 1e-9 &&
+    Math.abs(corner.x - cg.marginMm) < 1e-9 &&
+    Math.abs(corner.y - (calibSheet.heightMm - cg.marginMm)) < 1e-9 &&
+    hLine.points[1].x <= calibSheet.widthMm &&
+    vLine.points[1].y >= 0
+  checks.push(
+    ok(
+      'calib-geometry',
+      '校准试切件：横/竖标准线长度与角点坐标正确（内部左上原点，导出翻到左下），且不超出纸幅',
+      geomOk,
+      `横线 ${hLen}mm（标准 ${cg.stdXMm}）｜竖线 ${vLen}mm（标准 ${cg.stdYMm}）｜内部角点 (${corner.x}, ${corner.y})mm｜共 ${cg.steps.length} 段（含端部刻度）`,
+    ),
+  )
+
+  // 模拟机器（physical = commanded/s + e）：横向切小（sX=1.01）、纵向切大（sY=0.995），
+  // 原点物理偏差 eX=1.2mm（偏进纸内）、eY=-0.8mm
+  const simStdX = cg.stdXMm
+  const simStdY = cg.stdYMm
+  const trueSx = 1.01
+  const trueSy = 0.995
+  const trueEX = 1.2
+  const trueEY = -0.8
+  const measX = simStdX / trueSx
+  const measY = simStdY / trueSy
+  // 角点指令在 testMargin → 实测原点 = testMargin/s + e
+  const measOriginX = cg.marginMm / trueSx + trueEX
+  const measOriginY = cg.marginMm / trueSy + trueEY
+
+  const calc = computeCalibration({
+    machine: '自检机',
+    paper: 'red-paper',
+    paperLabel: '红纸',
+    sheet: calibSheet,
+    measuredXMm: measX,
+    measuredYMm: measY,
+    originXMm: measOriginX,
+    originYMm: measOriginY,
+    stdXMm: simStdX,
+    stdYMm: simStdY,
+    marginMm: cg.marginMm,
+  })
+  // 反算回真实缩放；原点指令平移 ox = testMargin − s·实测原点 = −s·e
+  const expectOx = cg.marginMm - trueSx * measOriginX
+  const expectOy = cg.marginMm - trueSy * measOriginY
+  const recoverOk =
+    Math.abs(calc.scaleX - trueSx) < 1e-9 &&
+    Math.abs(calc.scaleY - trueSy) < 1e-9 &&
+    Math.abs(calc.offsetXMm - expectOx) < 1e-9 &&
+    Math.abs(calc.offsetYMm - expectOy) < 1e-9
+  checks.push(
+    ok(
+      'calib-solve',
+      '由横竖实测长度反算缩放系数与原点偏移（s = 标准/实测，o = 试切边距 − s·实测原点）',
+      recoverOk && !calc.error,
+      `真值 sX=${trueSx} sY=${trueSy} eX=${trueEX} eY=${trueEY} → 反算 sX=${calc.scaleX.toFixed(6)} sY=${calc.scaleY.toFixed(6)} oX=${calc.offsetXMm.toFixed(6)}（−s·e=${(-trueSx * trueEX).toFixed(6)}）oY=${calc.offsetYMm.toFixed(6)}`,
+    ),
+  )
+
+  // 同机同纸二次校准 → 追加历史；换纸 → 新档案
+  const baseInput = {
+    machine: '自检机',
+    paperLabel: '红纸',
+    sheet: calibSheet,
+    measuredXMm: measX,
+    measuredYMm: measY,
+    originXMm: measOriginX,
+    originYMm: measOriginY,
+    stdXMm: simStdX,
+    stdYMm: simStdY,
+    marginMm: cg.marginMm,
+  }
+  const r1 = upsertCalibration([], { ...baseInput, paper: 'red-paper' })
+  const r2 = upsertCalibration(r1.profiles, { ...baseInput, paper: 'red-paper' })
+  const r3 = upsertCalibration(r2.profiles, { ...baseInput, paper: 'xuan', paperLabel: '宣纸', measuredXMm: simStdX / 1.02 })
+  const archiveOk =
+    r1.created &&
+    !r2.created &&
+    r2.profile.history.length === 2 &&
+    r3.created &&
+    r3.profiles.length === 2 &&
+    Math.abs(r3.profile.scaleX - 1.02) < 1e-6
+  checks.push(
+    ok(
+      'calib-archive',
+      '一台机器+一种纸一条档案：同机同纸追加留档，同机换纸新建档案',
+      archiveOk,
+      `红纸档案 ${r2.profile.history.length} 次校准（留档可对比漂移）｜换宣纸后档案数 ${r3.profiles.length}，sX=${r3.profile.scaleX.toFixed(4)}`,
+    ),
+  )
+
+  // 补偿后摆放：用 100×80 设计矩形（原点 0,0），补偿后机器切回设计尺寸且落到纸边距
+  const rectPts: Pt[] = [
+    { x: 0, y: 0 },
+    { x: 100, y: 0 },
+    { x: 100, y: 80 },
+    { x: 0, y: 80 },
+  ]
+  const rectSteps: CutStep[] = [
+    {
+      seq: 1,
+      contourId: 'calrect',
+      runIndex: 0,
+      runCount: 1,
+      points: rectPts,
+      closed: true,
+      startPt: rectPts[0],
+      endPt: rectPts[0],
+      travelFromPrevMm: 0,
+      level: 1,
+      layer: 0,
+      lengthMm: 360,
+    },
+  ]
+  const calibPL = computePlacement(rectSteps, calibSheet, 1, SHEET_MARGIN_MM, r2.profile)
+  // 导出指令（摆放到纸面后）的包围盒
+  const cmdMinX = calibPL.placedBounds.minX
+  const cmdMinY = calibPL.placedBounds.minY
+  const cmdW = calibPL.placedBounds.maxX - cmdMinX
+  const cmdH = calibPL.placedBounds.maxY - cmdMinY
+  // 机器实际切出的物理尺寸/位置
+  const physMinX = cmdMinX / trueSx + trueEX
+  const physMinY = cmdMinY / trueSy + trueEY
+  const physW = cmdW / trueSx
+  const physH = cmdH / trueSy
+  const compensateOk =
+    Math.abs(physW - 100) < 1e-6 &&
+    Math.abs(physH - 80) < 1e-6 &&
+    Math.abs(physMinX - SHEET_MARGIN_MM) < 1e-6 &&
+    Math.abs(physMinY - SHEET_MARGIN_MM) < 1e-6
+  checks.push(
+    ok(
+      'calib-placement',
+      '导出按档案先补偿整张图：机器切回设计尺寸，原点偏移被抵消到纸边距',
+      compensateOk,
+      `设计 100×80mm → 指令 ${cmdW.toFixed(3)}×${cmdH.toFixed(3)}mm → 实切 ${physW.toFixed(4)}×${physH.toFixed(4)}mm｜起点物理 (${physMinX.toFixed(4)}, ${physMinY.toFixed(4)})mm（边距 ${SHEET_MARGIN_MM}）`,
+    ),
+  )
+
+  // 偏差超阈值必须被标记（不静默套用）
+  const bigDev = upsertCalibration([], {
+    ...baseInput,
+    machine: '超差机',
+    paper: 'flock',
+    paperLabel: '植绒',
+    measuredXMm: simStdX / 1.05, // 5% 偏差
+    measuredYMm: simStdY / 1.05,
+    warnScalePct: 2,
+  }).profile
+  const status = profileStatus(bigDev)
+  checks.push(
+    ok(
+      'calib-warning',
+      '偏差超过阈值时标记重新校准，而不是静默套用旧档案',
+      status.level === 'err' && status.messages.some((m) => m.includes('横向')),
+      `5% 偏差档案状态=${status.level}：${status.messages.join('；') || '（无提示）'}`,
+    ),
+  )
+
+  // 试切件 PLT/SVG 不做补偿（identity），落在纸幅内，起刀点为试切角点
+  const calibMeta: ExportMeta = {
+    projectName: '校准自检',
+    formName: '校准试切件',
+    material: mat,
+    bridgeWidthMm: 0,
+    passes: 1,
+    sheet: calibSheet,
+    cutLengthMm: cg.steps.reduce((a, s) => a + s.lengthMm, 0),
+    travelMm: 0,
+  }
+  const calibPlt = exportPlt(
+    cg.steps,
+    { format: 'plt', unit: '0.025mm', origin: 'bottom_left', yFlip: true, scale: 1 },
+    calibSheet,
+    calibMeta,
+    identityPlacement(calibSheet),
+  )
+  const calibSvg = buildCalibSheet(cg.steps, calibSheet, { machine: '自检机', paper: '红纸', stdXMm: cg.stdXMm, stdYMm: cg.stdYMm, marginMm: cg.marginMm })
+  const startUnits = Math.round(cg.marginMm / 0.025)
+  const testcutRawOk =
+    calibPlt.outOfSheet === false &&
+    calibPlt.text.includes(`PU${startUnits},${startUnits};`) &&
+    calibSvg.includes(`横向标准线 ${cg.stdXMm}mm`) &&
+    calibPlt.minX >= 0 &&
+    calibPlt.minY >= 0
+  checks.push(
+    ok(
+      'calib-testcut-export',
+      '试切件刀路不做补偿：坐标即纸面坐标、落在纸幅内，起刀点为标准角点',
+      testcutRawOk,
+      `PLT X ${calibPlt.minX}~${calibPlt.maxX} / Y ${calibPlt.minY}~${calibPlt.maxY}（纸幅 ${calibPlt.sheetMaxX}×${calibPlt.sheetMaxY}），起刀指令 PU${startUnits},${startUnits}`,
     ),
   )
 

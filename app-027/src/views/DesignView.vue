@@ -7,8 +7,10 @@ import { PATTERN_LIBRARY, fetchPatternText } from '@/data/patterns'
 import type { Contour, ContourWarning, Pt, Shape } from '@/logic/types'
 import type { ComputedShape } from '@/logic/pipeline'
 import { makeContour } from '@/logic/cleanup'
-import { dist, uid } from '@/logic/geometry'
+import { boundsOf, dist, uid } from '@/logic/geometry'
 import { arcToCubics, sampleCubicInto } from '@/logic/svg'
+import { profileStatus, uncompensatedPoint, uncompensatedBounds } from '@/logic/calibration'
+import { paperText } from '@/logic/calibration'
 
 type Mode = 'outline' | 'toolpath' | 'bridge'
 type Tool = 'select' | 'pan' | 'rect' | 'circle' | 'polygon' | 'bridge'
@@ -332,6 +334,47 @@ const computedMap = computed(() => {
   }
   return m
 })
+
+// ---------------- 机器×纸张补偿预览 ----------------
+const showCompensation = ref(false)
+const calib = computed(() => (project.value ? store.calibrationOf(project.value) : null))
+const calibStatus = computed(() => (calib.value ? profileStatus(calib.value) : null))
+
+function pathD(pts: Pt[], closed: boolean): string {
+  if (pts.length === 0) return ''
+  let d = `M${pts[0].x.toFixed(3)} ${pts[0].y.toFixed(3)}`
+  for (let i = 1; i < pts.length; i++) d += `L${pts[i].x.toFixed(3)} ${pts[i].y.toFixed(3)}`
+  if (closed) d += 'Z'
+  return d
+}
+
+/** 补偿对比叠加层（设计坐标）：绿=补偿后实际切出（与设计重合）；红=不补偿直接切的实际效果 */
+const compareOverlays = computed(() => {
+  if (!showCompensation.value || !calib.value) return null
+  const c = calib.value
+  const compensated: string[] = []
+  const uncompensated: string[] = []
+  for (const s of shapes.value) {
+    for (const ct of s.contours) {
+      if (ct.points.length < 2) continue
+      compensated.push(pathD(ct.points, ct.closed))
+      uncompensated.push(pathD(ct.points.map((p) => uncompensatedPoint(p, c)), ct.closed))
+    }
+  }
+  return { compensated, uncompensated }
+})
+
+const compareExtraBounds = computed(() => {
+  if (!showCompensation.value || !calib.value) return null
+  const all = shapes.value.flatMap((s) => s.contours.flatMap((c) => c.points))
+  if (all.length === 0) return null
+  return uncompensatedBounds(boundsOf(all), calib.value)
+})
+
+const compDeltaMm = computed(() => {
+  if (!calib.value) return { x: 0, y: 0 }
+  return { x: calib.value.offsetXMm / calib.value.scaleX, y: calib.value.offsetYMm / calib.value.scaleY }
+})
 </script>
 
 <template>
@@ -421,13 +464,16 @@ const computedMap = computed(() => {
         ref="canvas"
         :shapes="shapes"
         :computed="computedMap"
-        :mode="mode"
+        :mode="showCompensation && calib ? 'outline' : mode"
         :tool="tool"
-        :show-numbers="mode === 'toolpath'"
-        :show-travel="mode === 'toolpath'"
+        :sheet="showCompensation && calib ? project.sheet : null"
+        :show-numbers="mode === 'toolpath' && !(showCompensation && calib)"
+        :show-travel="mode === 'toolpath' && !(showCompensation && calib)"
         :magnify="true"
         :selected-contour-id="selectedContourId"
-        :status-text="mode === 'bridge' ? '缺口已放大 8 倍' : ''"
+        :compare-overlays="compareOverlays"
+        :extra-bounds="compareExtraBounds"
+        :status-text="showCompensation && calib ? `补偿对比：绿=补偿后实切效果，红=不补偿实切效果（偏差 横 ${((calib.scaleX - 1) * 100).toFixed(2)}% / 纵 ${((calib.scaleY - 1) * 100).toFixed(2)}%，位移 ${compDeltaMm.x.toFixed(2)}, ${compDeltaMm.y.toFixed(2)}mm）` : mode === 'bridge' ? '缺口已放大 8 倍' : ''"
         @select-contour="onSelectContour"
         @create-rect="onRect"
         @create-circle="onCircle"
@@ -437,13 +483,19 @@ const computedMap = computed(() => {
       />
       <div class="panel-foot">
         <div class="legend">
-          <span v-if="mode === 'outline'"><i style="background: #cfd9e4"></i>轮廓</span>
-          <span><i style="background: #ffc857"></i>未闭合</span>
-          <span><i style="background: #ff6b6b"></i>自交</span>
-          <span><i style="background: #b48cff"></i>重复路径</span>
-          <span v-if="mode === 'toolpath'"><i style="background: #ff8f3c"></i>刀路</span>
-          <span v-if="mode === 'toolpath'"><i style="background: #7f8fa3"></i>跳刀</span>
-          <span v-if="mode === 'bridge'"><i style="background: #47c07a"></i>连刀点缺口</span>
+          <template v-if="showCompensation && calib">
+            <span><i style="background: #47c07a"></i>补偿后实切（与设计重合）</span>
+            <span><i style="background: #ff6b6b"></i>不补偿实切（红虚线）</span>
+          </template>
+          <template v-else>
+            <span v-if="mode === 'outline'"><i style="background: #cfd9e4"></i>轮廓</span>
+            <span><i style="background: #ffc857"></i>未闭合</span>
+            <span><i style="background: #ff6b6b"></i>自交</span>
+            <span><i style="background: #b48cff"></i>重复路径</span>
+            <span v-if="mode === 'toolpath'"><i style="background: #ff8f3c"></i>刀路</span>
+            <span v-if="mode === 'toolpath'"><i style="background: #7f8fa3"></i>跳刀</span>
+            <span v-if="mode === 'bridge'"><i style="background: #47c07a"></i>连刀点缺口</span>
+          </template>
         </div>
       </div>
     </div>
@@ -566,6 +618,34 @@ const computedMap = computed(() => {
         </div>
 
         <div class="section">
+          <div class="section-title">机器 × 纸张补偿预览</div>
+          <label class="check">
+            <input type="checkbox" :checked="showCompensation" :disabled="!calib" @change="showCompensation = ($event.target as HTMLInputElement).checked" />
+            叠加补偿后 / 未补偿轮廓对比
+          </label>
+          <div v-if="!calib" class="hint">
+            本项目尚未选择校准档案。
+            <RouterLink :to="`/calibration?project=${project.id}`">去做试切校准</RouterLink>
+            ，或在导出页选择已有档案。
+          </div>
+          <div v-else class="calib-box">
+            <div class="hint">
+              档案：<b>{{ calib.machine }}</b> · {{ paperText(calib.paper, calib.paperLabel) }}｜sX
+              <b class="mono">{{ calib.scaleX.toFixed(4) }}</b> / sY <b class="mono">{{ calib.scaleY.toFixed(4) }}</b>｜原点
+              <b class="mono">{{ calib.offsetXMm.toFixed(2) }}, {{ calib.offsetYMm.toFixed(2) }}</b>mm
+            </div>
+            <div v-if="calibStatus && calibStatus.level === 'err'" class="banner err tight">
+              {{ calibStatus.messages.join('；') }}，建议重新校准。
+            </div>
+            <div class="hint" v-if="showCompensation">
+              绿线为补偿后切出的成品（与设计重合）；红虚线为不补偿直接切的实际效果：整体缩放差
+              {{ ((calib.scaleX - 1) * 100).toFixed(2) }}%/{{ ((calib.scaleY - 1) * 100).toFixed(2) }}%，位置偏移
+              {{ compDeltaMm.x.toFixed(2) }}/{{ compDeltaMm.y.toFixed(2) }}mm。
+            </div>
+          </div>
+        </div>
+
+        <div class="section">
           <div class="section-title">材料</div>
           <select :value="project.materialId" @change="store.setMaterial(project, ($event.target as HTMLSelectElement).value)">
             <option v-for="m in state.materials" :key="m.id" :value="m.id">{{ m.name }}</option>
@@ -620,5 +700,23 @@ const computedMap = computed(() => {
   font-size: 11px;
   color: var(--text-mute);
   line-height: 1.7;
+}
+
+.calib-box {
+  margin-top: 4px;
+  padding: 6px 8px;
+  background: var(--panel-2);
+  border: 1px solid var(--line-soft);
+  border-radius: 5px;
+}
+
+.calib-box b {
+  color: var(--text);
+}
+
+.banner.tight {
+  padding: 4px 7px;
+  font-size: 11px;
+  margin: 5px 0;
 }
 </style>

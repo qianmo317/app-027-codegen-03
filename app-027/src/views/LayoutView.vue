@@ -38,23 +38,29 @@ const computedMap = computed(() => {
 const placement = computed(() => {
   const p = project.value
   if (!p || !job.value) return null
-  return computePlacement(job.value.steps, p.sheet, p.export.scale)
+  return computePlacement(job.value.steps, p.sheet, p.export.scale, SHEET_MARGIN_MM, store.calibrationOf(p))
 })
 
-/** 纸幅是否放得下 */
+/** 纸幅是否放得下（含机器校准缩放） */
 const fitInfo = computed(() => {
   const p = project.value
-  if (!p || !job.value) return null
+  if (!p || !job.value || !placement.value) return null
   const pts: Pt[] = []
   for (const st of job.value.steps) pts.push(...st.points)
   if (pts.length === 0) return null
   const b = boundsOf(pts)
-  const w = (b.maxX - b.minX) * p.export.scale
-  const h = (b.maxY - b.minY) * p.export.scale
+  const pl = placement.value
+  const w = (b.maxX - b.minX) * pl.scaleX
+  const h = (b.maxY - b.minY) * pl.scaleY
   const availW = p.sheet.widthMm - SHEET_MARGIN_MM * 2
   const availH = p.sheet.heightMm - SHEET_MARGIN_MM * 2
   const fits = w <= availW + 0.01 && h <= availH + 0.01
-  return { w, h, availW, availH, fits, suggestScale: fits ? p.export.scale : Math.min(availW / (b.maxX - b.minX || 1), availH / (b.maxY - b.minY || 1)) }
+  const calSx = pl.scaleX / p.export.scale
+  const calSy = pl.scaleY / p.export.scale
+  const suggestScale = fits
+    ? p.export.scale
+    : Math.min(availW / ((b.maxX - b.minX) * calSx || 1), availH / ((b.maxY - b.minY) * calSy || 1))
+  return { w, h, availW, availH, fits, suggestScale }
 })
 
 function autoFit(): void {

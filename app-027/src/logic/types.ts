@@ -64,6 +64,67 @@ export type ExportCfg = {
   scale: number
 }
 
+/** 一次试切实测记录（留档，不删除，可追溯同机换纸前后差异） */
+export type CalibrationMeasurement = {
+  id: string
+  /** 实测横向线长（mm） */
+  measuredXMm: number
+  /** 实测纵向线长（mm） */
+  measuredYMm: number
+  /** 横向刻线到纸左缘的实测距离（mm） */
+  originXMm: number
+  /** 纵向刻线到纸下缘的实测距离（mm） */
+  originYMm: number
+  createdAt: number
+  /** 本次算出的横向缩放补偿（设计 → 指令） */
+  scaleX: number
+  /** 本次算出的纵向缩放补偿 */
+  scaleY: number
+  /** 本次算出的横向原点修正（mm，正值=机器原点偏进纸内） */
+  offsetXMm: number
+  /** 本次算出的纵向原点修正（mm） */
+  offsetYMm: number
+}
+
+/** 机器 × 纸张校准档案（一台机器 + 一种纸 = 一条） */
+export type CalibrationProfile = {
+  id: string
+  /** 机器名（同一台机器的所有纸共用） */
+  machine: string
+  /** 纸张键（内置 PAPER_KINDS 的 paper，或自定义纸名） */
+  paper: string
+  /** 自定义纸名时的显示名 */
+  paperLabel: string
+  sheet: Sheet
+  /** 试切标准线长（mm） */
+  stdXMm: number
+  stdYMm: number
+  /** 试切 L 形角点的指令坐标（距纸左/下，mm） */
+  marginMm: number
+  /** 最近一次校准结果（补偿参数） */
+  scaleX: number
+  scaleY: number
+  offsetXMm: number
+  offsetYMm: number
+  /** 超过该比例（相对 1.0）提示重新校准，默认 2% */
+  warnScalePct: number
+  /** 原点修正超过该值（mm）提示重新校准，默认 3mm */
+  warnOriginMm: number
+  /** 两次校准缩放变化超过该比例（%）提示机器/纸张状态漂移，默认 1% */
+  driftScalePct: number
+  createdAt: number
+  updatedAt: number
+  history: CalibrationMeasurement[]
+  note: string
+}
+
+export const DEFAULT_WARN_SCALE_PCT = 2
+export const DEFAULT_WARN_ORIGIN_MM = 3
+export const DEFAULT_DRIFT_SCALE_PCT = 1
+/** 试切件 L 形角点距纸左/下的指令距离（mm） */
+export const CALIB_MARGIN_MM = 15
+export const CALIB_MIN_LEN_MM = 50
+
 export type Sheet = { widthMm: number; heightMm: number; name: string }
 
 /** 项目（保存到本地存储） */
@@ -77,6 +138,8 @@ export type Project = {
   export: ExportCfg
   sheet: Sheet
   materialId: string
+  /** 选中的机器×纸张校准档案 id（导出时先补偿整张图） */
+  calibrationId: string
   /** 图层名（多色纸分层切割） */
   layerNames: string[]
   /** 批量排版配置 */

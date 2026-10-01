@@ -2,7 +2,7 @@
 import { computed, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import PreviewCanvas from '@/components/PreviewCanvas.vue'
-import { store } from '@/logic/store'
+import { store, state } from '@/logic/store'
 import { SHEET_PRESETS, type ExportCfg, type Sheet } from '@/logic/types'
 import type { ComputedShape } from '@/logic/pipeline'
 import {
@@ -15,6 +15,7 @@ import {
   type ExportMeta,
   type ExportStats,
 } from '@/logic/exporters'
+import { paperText, profileDrift, profileLabel, profileStatus } from '@/logic/calibration'
 import { downloadText, sanitizeFilename } from '@/logic/download'
 import { boundsOf } from '@/logic/geometry'
 
@@ -45,10 +46,38 @@ const computedMap = computed(() => {
 
 const cfg = computed<ExportCfg>(() => project.value?.export ?? { format: 'plt', unit: '0.025mm', origin: 'bottom_left', yFlip: true, scale: 1 })
 
+/** 项目选中的校准档案（id 失效时为 null，不悄悄换别的档案） */
+const calib = computed(() => (project.value ? store.calibrationOf(project.value) : null))
+
+const calibStatus = computed(() => (calib.value ? profileStatus(calib.value) : null))
+const calibDrift = computed(() => (calib.value ? profileDrift(calib.value) : null))
+/** 导出前必须确认的硬性提醒（偏差超阈值 / 档案丢失 / 纸张疑似不符） */
+const calibBlockers = computed<string[]>(() => {
+  const p = project.value
+  if (!p) return []
+  const out: string[] = []
+  if (p.calibrationId && !calib.value) out.push('之前选中的校准档案已被删除，请重新选择或重新校准（不会自动套用其他档案）。')
+  if (calib.value && calibStatus.value?.level === 'err') out.push(...calibStatus.value.messages.map((m) => `校准偏差超阈值：${m}`))
+  if (calib.value && calibDrift.value?.drifted) out.push(...calibDrift.value.messages.map((m) => `${m}，机器/纸张状态可能已变化`))
+  if (calib.value && material.value && calib.value.paper !== material.value.paper) {
+    out.push(`档案纸张为「${paperText(calib.value.paper, calib.value.paperLabel)}」，当前材料预设纸张为「${paperText(material.value.paper, material.value.paper)}」，请确认是否同一种纸。`)
+  }
+  return out
+})
+const acknowledged = ref(false)
+const blockAcknowledged = computed(() => calibBlockers.value.length === 0 || acknowledged.value)
+
+function selectCalib(id: string): void {
+  const p = project.value
+  if (!p) return
+  store.setCalibration(p, id)
+  acknowledged.value = false
+}
+
 const placement = computed(() => {
   const p = project.value
   if (!p || !job.value) return null
-  return computePlacement(job.value.steps, p.sheet, p.export.scale)
+  return computePlacement(job.value.steps, p.sheet, p.export.scale, SHEET_MARGIN_MM, calib.value)
 })
 
 const meta = computed<ExportMeta | null>(() => {
@@ -83,23 +112,29 @@ const previewLines = computed(() => {
 
 const lineCount = computed(() => (stats.value ? stats.value.text.split('\n').length : 0))
 
+/** 补偿后的成品包围盒（已含机器 sX/sY 与用户缩放），纸幅适配提示据此重算 */
 const sizeInfo = computed(() => {
   const p = project.value
-  if (!p || !job.value) return null
-  const pts = job.value.steps.flatMap((s) => s.points)
-  if (pts.length === 0) return null
-  const b = boundsOf(pts)
-  const w = (b.maxX - b.minX) * p.export.scale
-  const h = (b.maxY - b.minY) * p.export.scale
+  if (!p || !job.value || !placement.value) return null
+  const pl = placement.value
+  const b = pl.placedBounds
+  const w = b.maxX - b.minX
+  const h = b.maxY - b.minY
   const availW = p.sheet.widthMm - SHEET_MARGIN_MM * 2
   const availH = p.sheet.heightMm - SHEET_MARGIN_MM * 2
+  // 建议用户缩放：按补偿后包围盒反推（缩放各轴受限时取较小值）
+  const rawPts = job.value.steps.flatMap((s) => s.points)
+  const rb = boundsOf(rawPts)
+  const sx = pl.scaleX / p.export.scale
+  const sy = pl.scaleY / p.export.scale
+  const suggestScale = Math.min(availW / ((rb.maxX - rb.minX) * sx || 1), availH / ((rb.maxY - rb.minY) * sy || 1))
   return {
     w,
     h,
     availW,
     availH,
     fits: w <= availW + 0.01 && h <= availH + 0.01,
-    suggestScale: Math.min(availW / (b.maxX - b.minX || 1), availH / (b.maxY - b.minY || 1)),
+    suggestScale,
   }
 })
 
@@ -138,6 +173,7 @@ function mime(): string {
 function doDownload(): void {
   const p = project.value
   if (!p || !stats.value) return
+  if (!blockAcknowledged.value) return
   const name = `${sanitizeFilename(p.name)}_${cfg.value.format}.${ext()}`
   downloadText(name, stats.value.text, mime())
 }
@@ -184,6 +220,7 @@ function downloadA4(): void {
         <span class="spacer"></span>
         <span class="tag mono">{{ project.sheet.widthMm }}×{{ project.sheet.heightMm }}mm</span>
         <span class="tag mono">缩放 {{ (project.export.scale * 100).toFixed(0) }}%</span>
+        <span class="tag" :class="calib ? 'ok' : ''">{{ calib ? `已补偿：${profileLabel(calib)}` : '未用校准' }}</span>
       </div>
       <PreviewCanvas
         ref="canvas"
@@ -195,7 +232,7 @@ function downloadA4(): void {
         :show-numbers="false"
         :show-travel="false"
         :placement="placement"
-        :status-text="`${job?.runCount ?? 0} 段刀路已放入纸幅（左边距 ${SHEET_MARGIN_MM}mm）`"
+        :status-text="calib ? `刀路已按 ${calib.machine}/${paperText(calib.paper, calib.paperLabel)} 补偿后放入纸幅` : `${job?.runCount ?? 0} 段刀路已放入纸幅（左边距 ${SHEET_MARGIN_MM}mm）`"
       />
       <div class="panel-foot">
         <div class="btn-row">
@@ -210,9 +247,45 @@ function downloadA4(): void {
       <div class="panel-head">
         导出设置
         <span class="spacer"></span>
-        <button class="tiny primary" @click="doDownload">下载 {{ cfg.format.toUpperCase() }}</button>
+        <button class="tiny primary" :disabled="!blockAcknowledged" @click="doDownload">下载 {{ cfg.format.toUpperCase() }}</button>
       </div>
       <div class="panel-body">
+        <div class="section">
+          <div class="section-title">
+            机器 × 纸张校准
+            <span class="spacer"></span>
+            <RouterLink class="tiny" :to="`/calibration?project=${project.id}&paper=${material?.paper ?? ''}`">新建 / 管理档案</RouterLink>
+          </div>
+          <select :value="project.calibrationId" @change="selectCalib(($event.target as HTMLSelectElement).value)">
+            <option value="">不使用校准（按设计原样导出）</option>
+            <option v-for="c in state.calibrations" :key="c.id" :value="c.id">
+              {{ profileLabel(c) }}（sX {{ c.scaleX.toFixed(4) }} / sY {{ c.scaleY.toFixed(4) }}）
+            </option>
+          </select>
+          <div v-if="calib" class="calib-detail">
+            <div class="prof-params">
+              <span>sX <b>{{ calib.scaleX.toFixed(4) }}</b></span>
+              <span>sY <b>{{ calib.scaleY.toFixed(4) }}</b></span>
+              <span>oX <b>{{ calib.offsetXMm.toFixed(2) }}</b>mm</span>
+              <span>oY <b>{{ calib.offsetYMm.toFixed(2) }}</b>mm</span>
+            </div>
+            <div class="hint">
+              最近校准 {{ new Date(calib.updatedAt).toLocaleDateString() }}｜共 {{ calib.history.length }} 次｜试切标准线
+              {{ calib.stdXMm }}×{{ calib.stdYMm }}mm
+            </div>
+          </div>
+          <div v-else class="hint">未选档案时不做缩放/原点补偿。同一张图换机器或换纸，尺寸会不一样，建议先做校准。</div>
+
+          <div v-for="(msg, i) in calibBlockers" :key="i" class="banner err tight">⚠ {{ msg }}</div>
+          <div v-if="calibBlockers.length" class="ack-row">
+            <label class="check">
+              <input type="checkbox" v-model="acknowledged" />
+              我已知晓偏差风险，仍要按当前档案导出（建议先去重新校准）
+            </label>
+            <button class="tiny" @click="router.push(`/calibration?project=${project.id}&paper=${material?.paper ?? ''}`)">去重新校准</button>
+          </div>
+        </div>
+
         <div class="section">
           <div class="section-title">格式与单位</div>
           <div class="field-row">
@@ -277,7 +350,9 @@ function downloadA4(): void {
             <button class="tiny" :disabled="!sizeInfo" @click="autoFit">自动适配</button>
           </div>
           <div v-if="sizeInfo" class="hint">
-            纹样 {{ sizeInfo.w.toFixed(1) }}×{{ sizeInfo.h.toFixed(1) }}mm｜可用 {{ sizeInfo.availW.toFixed(0) }}×{{ sizeInfo.availH.toFixed(0) }}mm
+            <template v-if="calib">补偿后成品 {{ sizeInfo.w.toFixed(1) }}×{{ sizeInfo.h.toFixed(1) }}mm｜</template>
+            <template v-else>纹样 {{ sizeInfo.w.toFixed(1) }}×{{ sizeInfo.h.toFixed(1) }}mm｜</template>
+            可用 {{ sizeInfo.availW.toFixed(0) }}×{{ sizeInfo.availH.toFixed(0) }}mm
             <span v-if="sizeInfo.fits" class="tag ok">可放入纸幅</span>
             <span v-else class="tag err">超出纸幅，请缩小或换大纸</span>
           </div>
@@ -359,6 +434,41 @@ function downloadA4(): void {
   font-size: 12px;
   color: var(--text-dim);
   margin: 5px 0;
+}
+
+.calib-detail {
+  margin-top: 6px;
+  padding: 6px 8px;
+  background: var(--panel-2);
+  border: 1px solid var(--line-soft);
+  border-radius: 5px;
+}
+
+.prof-params {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.prof-params b {
+  font-family: var(--mono);
+  color: var(--text);
+}
+
+.banner.tight {
+  padding: 4px 7px;
+  font-size: 11.5px;
+  margin: 5px 0 0;
+}
+
+.ack-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 5px;
 }
 
 .print-area .sheet :deep(svg) {

@@ -28,6 +28,12 @@ const props = withDefaults(
     simIndex?: number
     placement?: SheetPlacement | null
     statusText?: string
+    /** 补偿对比叠加层（设计坐标的 SVG path）：补偿前（灰虚线）与未补偿实际效果（红虚线） */
+    compareOverlays?: { compensated: string[]; uncompensated: string[] } | null
+    /** 补偿对比时额外纳入自适应的包围盒（设计坐标） */
+    extraBounds?: { minX: number; minY: number; maxX: number; maxY: number } | null
+    /** 是否淡化原始轮廓（对比模式下） */
+    dimOriginals?: boolean
   }>(),
   {
     job: null,
@@ -43,6 +49,9 @@ const props = withDefaults(
     simIndex: -1,
     placement: null,
     statusText: '',
+    compareOverlays: null,
+    extraBounds: null,
+    dimOriginals: false,
   },
 )
 
@@ -78,6 +87,7 @@ function contentBounds() {
     list.push(boundsOf(s.contours.flatMap((c) => c.points)))
   }
   if (props.sheet) list.push({ minX: 0, minY: 0, maxX: props.sheet.widthMm, maxY: props.sheet.heightMm })
+  if (props.extraBounds) list.push(props.extraBounds)
   if (list.length === 0) return { minX: 0, minY: 0, maxX: 100, maxY: 100 }
   return mergeBounds(list)
 }
@@ -327,6 +337,9 @@ const outlineContours = computed<DrawContour[]>(() => {
   return out
 })
 
+/** 补偿对比模式下，原始设计轮廓用补偿后（绿实线）与未补偿实际效果（红虚线）叠加表示 */
+const compareActive = computed(() => !!props.compareOverlays && (props.compareOverlays.compensated.length > 0 || props.compareOverlays.uncompensated.length > 0))
+
 const pl = (p: Pt): Pt => (props.placement ? placePoint(p, props.placement) : p)
 
 const cutSteps = computed<CutStep[]>(() => {
@@ -522,7 +535,7 @@ function focusContour(id: string): void {
         />
 
         <!-- 成品轮廓 -->
-        <g v-if="mode === 'outline' || mode === 'bridge' || !job" fill="none" stroke-linecap="round" stroke-linejoin="round">
+        <g v-if="(mode === 'outline' || mode === 'bridge' || !job) && !compareActive" fill="none" stroke-linecap="round" stroke-linejoin="round">
           <path
             v-for="c in outlineContours"
             :key="c.id"
@@ -530,6 +543,27 @@ function focusContour(id: string): void {
             :stroke="c.color"
             :stroke-dasharray="c.dash"
             :stroke-width="c.width"
+            vector-effect="non-scaling-stroke"
+          />
+        </g>
+
+        <!-- 补偿对比：补偿后（绿实线，即导出刀路）＋ 未补偿实际切出（红虚线） -->
+        <g v-if="compareActive" fill="none" stroke-linecap="round" stroke-linejoin="round">
+          <path
+            v-for="(d, i) in compareOverlays!.compensated"
+            :key="`cmp-c${i}`"
+            :d="d"
+            stroke="#47c07a"
+            stroke-width="1.5"
+            vector-effect="non-scaling-stroke"
+          />
+          <path
+            v-for="(d, i) in compareOverlays!.uncompensated"
+            :key="`cmp-u${i}`"
+            :d="d"
+            stroke="#ff6b6b"
+            stroke-width="1.1"
+            stroke-dasharray="6 4"
             vector-effect="non-scaling-stroke"
           />
         </g>

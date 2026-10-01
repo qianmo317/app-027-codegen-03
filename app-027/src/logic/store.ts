@@ -4,6 +4,7 @@ import {
   DEFAULT_EXPORT_CFG,
   DEFAULT_SHEET,
   type BatchCfg,
+  type CalibrationProfile,
   type ContourWarning,
   type CutSettings,
   type ExportCfg,
@@ -16,6 +17,7 @@ import { computeShape, shapeSignature, type ComputedShape } from './pipeline'
 import { buildBatchShape, buildJob, type Job } from './job'
 import { uid } from './geometry'
 import { importSvgText, type ImportResult } from './importer'
+import { upsertCalibration } from './calibration'
 import { defaultMaterials } from '@/data/materials'
 
 const LS_KEY = 'papercut-plotter-studio/v1'
@@ -24,11 +26,13 @@ type Persisted = {
   version: number
   projects: Project[]
   materials: MaterialPreset[]
+  calibrations: CalibrationProfile[]
 }
 
 type StoreState = {
   projects: Project[]
   materials: MaterialPreset[]
+  calibrations: CalibrationProfile[]
   ready: boolean
   lastError: string | null
 }
@@ -36,6 +40,7 @@ type StoreState = {
 export const state = reactive<StoreState>({
   projects: [],
   materials: [],
+  calibrations: [],
   ready: false,
   lastError: null,
 })
@@ -68,6 +73,9 @@ export function loadState(): void {
       if (parsed && Array.isArray(parsed.materials) && parsed.materials.length > 0) {
         state.materials = parsed.materials.map((m) => ({ ...m, backing: m.backing ?? '常规垫板' }))
       }
+      if (parsed && Array.isArray(parsed.calibrations)) {
+        state.calibrations = parsed.calibrations.map(normalizeCalibration)
+      }
     }
   } catch (e) {
     state.lastError = `本地数据读取失败：${(e as Error).message}`
@@ -79,7 +87,7 @@ export function loadState(): void {
 export function saveNow(): void {
   if (!canUseStorage()) return
   try {
-    const data: Persisted = { version: 1, projects: state.projects, materials: state.materials }
+    const data: Persisted = { version: 1, projects: state.projects, materials: state.materials, calibrations: state.calibrations }
     localStorage.setItem(LS_KEY, JSON.stringify(data))
   } catch (e) {
     state.lastError = `本地保存失败：${(e as Error).message}`
@@ -101,6 +109,7 @@ function normalizeProject(p: Project): Project {
     settings: { ...DEFAULT_CUT_SETTINGS, ...(p.settings ?? {}) },
     export: { ...DEFAULT_EXPORT_CFG, ...(p.export ?? {}) },
     sheet: p.sheet ?? { ...DEFAULT_SHEET },
+    calibrationId: p.calibrationId ?? '',
     shapes: (p.shapes ?? []).map((s) => ({
       ...s,
       contours: (s.contours ?? []).map((c) => ({ ...c, holes: c.holes ?? [], bridges: c.bridges ?? [], warnings: c.warnings ?? [] })),
@@ -109,8 +118,32 @@ function normalizeProject(p: Project): Project {
   }
 }
 
+function normalizeCalibration(c: CalibrationProfile): CalibrationProfile {
+  return {
+    ...c,
+    sheet: c.sheet ?? { ...DEFAULT_SHEET },
+    history: Array.isArray(c.history) ? c.history : [],
+    paperLabel: c.paperLabel ?? c.paper,
+    note: c.note ?? '',
+    warnScalePct: c.warnScalePct ?? 2,
+    warnOriginMm: c.warnOriginMm ?? 3,
+    driftScalePct: c.driftScalePct ?? 1,
+  }
+}
+
 export function materialOf(p: Project): MaterialPreset | null {
   return state.materials.find((m) => m.id === p.materialId) ?? state.materials[0] ?? null
+}
+
+/** 项目生效的校准档案（id 失效时返回 null，绝不悄悄换用别的档案） */
+export function calibrationOf(p: Project): CalibrationProfile | null {
+  if (!p.calibrationId) return null
+  return state.calibrations.find((c) => c.id === p.calibrationId) ?? null
+}
+
+export function setCalibration(p: Project, id: string): void {
+  p.calibrationId = id
+  touch(p)
 }
 
 /** 重算派生数据（清理结果 → 连刀点 → 刀补 → 包含树 → 切割顺序） */
@@ -198,6 +231,7 @@ function newProject(name: string, shapes: Shape[]): Project {
     export: { ...DEFAULT_EXPORT_CFG },
     sheet: { ...DEFAULT_SHEET },
     materialId: state.materials[0]?.id ?? '',
+    calibrationId: '',
     layerNames: ['图层 1'],
     batch: { enabled: false, rows: 2, cols: 2, gapXMm: 5, gapYMm: 5, sharedEdge: false, mode: 'repeat' },
   }
@@ -432,6 +466,33 @@ export function deleteMaterial(id: string): void {
   }
 }
 
+// ---------------- 校准档案 ----------------
+
+export function saveCalibration(input: Parameters<typeof upsertCalibration>[1]): { profile: CalibrationProfile; created: boolean } {
+  const { profiles, profile, created } = upsertCalibration(state.calibrations, input)
+  state.calibrations = profiles
+  scheduleSave()
+  return { profile, created }
+}
+
+export function updateCalibrationMeta(id: string, patch: Partial<Pick<CalibrationProfile, 'note' | 'warnScalePct' | 'warnOriginMm' | 'driftScalePct' | 'machine' | 'paperLabel'>>): void {
+  const c = state.calibrations.find((x) => x.id === id)
+  if (!c) return
+  Object.assign(c, patch)
+  c.updatedAt = Date.now()
+  scheduleSave()
+}
+
+export function deleteCalibration(id: string): void {
+  const i = state.calibrations.findIndex((x) => x.id === id)
+  if (i < 0) return
+  state.calibrations.splice(i, 1)
+  for (const p of state.projects) {
+    if (p.calibrationId === id) p.calibrationId = ''
+  }
+  scheduleSave()
+}
+
 // ---------------- 导入 ----------------
 
 export function importSvgToShapes(
@@ -464,6 +525,8 @@ export const store = {
   saveNow,
   scheduleSave,
   materialOf,
+  calibrationOf,
+  setCalibration,
   getProject,
   computedOf,
   jobOf,
@@ -488,6 +551,9 @@ export const store = {
   applySymmetry,
   upsertMaterial,
   deleteMaterial,
+  saveCalibration,
+  updateCalibrationMeta,
+  deleteCalibration,
   recomputeProject,
   recomputeAll,
   importSvgToShapes,

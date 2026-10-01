@@ -1,4 +1,4 @@
-import type { ExportCfg, MaterialPreset, Pt, Sheet } from './types'
+import type { CalibrationProfile, ExportCfg, MaterialPreset, Pt, Sheet } from './types'
 import type { CutStep } from './order'
 import { boundsOf, dist } from './geometry'
 
@@ -7,32 +7,75 @@ export type SheetPlacement = {
   marginMm: number
   offsetX: number
   offsetY: number
+  /** 用户缩放（不含机器补偿） */
   scale: number
+  /** 实际生效缩放 = 用户缩放 × 校准补偿 */
+  scaleX: number
+  scaleY: number
+  /** 生效的校准档案（无则为 null） */
+  profile: CalibrationProfile | null
   outOfSheet: boolean
   placedBounds: { minX: number; minY: number; maxX: number; maxY: number }
 }
 
 export const SHEET_MARGIN_MM = 10
 
-export function computePlacement(steps: CutStep[], sheet: Sheet, scale: number, marginMm = SHEET_MARGIN_MM): SheetPlacement {
+/** 摆放：先按校准档案做缩放/原点补偿，再整体平移，使补偿后包围盒左下落到纸边距 */
+export function computePlacement(
+  steps: CutStep[],
+  sheet: Sheet,
+  scale: number,
+  marginMm: number = SHEET_MARGIN_MM,
+  profile: CalibrationProfile | null = null,
+): SheetPlacement {
   const pts: Pt[] = []
   for (const st of steps) pts.push(...st.points)
   const b = pts.length > 0 ? boundsOf(pts) : { minX: 0, minY: 0, maxX: 0, maxY: 0 }
-  const offsetX = marginMm - b.minX * scale
-  const offsetY = marginMm - b.minY * scale
+  const calSx = profile?.scaleX ?? 1
+  const calSy = profile?.scaleY ?? 1
+  const calOx = profile?.offsetXMm ?? 0
+  const calOy = profile?.offsetYMm ?? 0
+  const scaleX = scale * calSx
+  const scaleY = scale * calSy
+  // 补偿后的指令坐标（未加摆放平移）：comp = s·design + o（o = −s·e）
+  const compMinX = b.minX * calSx + calOx
+  const compMinY = b.minY * calSy + calOy
+  const compMaxX = b.maxX * calSx + calOx
+  const compMaxY = b.maxY * calSy + calOy
+  // 纸面指令 = u·comp + offset；机器还原 physical = commanded/s + e。
+  // 要求左下角物理位置 = margin：
+  //   (u·compMin + offset)/s + e = margin  →  offset = s·margin − s·e − u·compMin = s·margin + o − u·compMin
+  const offsetX = calSx * marginMm + calOx - compMinX * scale
+  const offsetY = calSy * marginMm + calOy - compMinY * scale
   const placed = {
-    minX: b.minX * scale + offsetX,
-    minY: b.minY * scale + offsetY,
-    maxX: b.maxX * scale + offsetX,
-    maxY: b.maxY * scale + offsetY,
+    minX: compMinX * scale + offsetX,
+    minY: compMinY * scale + offsetY,
+    maxX: compMaxX * scale + offsetX,
+    maxY: compMaxY * scale + offsetY,
   }
+  // placed.min = s·margin + o = s·(margin − e)（指令空间）；机器还原后 physical.min = margin
   const outOfSheet =
     placed.minX < -0.01 || placed.minY < -0.01 || placed.maxX > sheet.widthMm + 0.01 || placed.maxY > sheet.heightMm + 0.01
-  return { marginMm, offsetX, offsetY, scale, outOfSheet, placedBounds: placed }
+  return { marginMm, offsetX, offsetY, scale, scaleX, scaleY, profile, outOfSheet, placedBounds: placed }
+}
+
+/** 试切件专用：几何已按纸幅坐标直接生成，不再平移/缩放/补偿 */
+export function identityPlacement(sheet: Sheet): SheetPlacement {
+  return {
+    marginMm: 0,
+    offsetX: 0,
+    offsetY: 0,
+    scale: 1,
+    scaleX: 1,
+    scaleY: 1,
+    profile: null,
+    outOfSheet: false,
+    placedBounds: { minX: 0, minY: 0, maxX: sheet.widthMm, maxY: sheet.heightMm },
+  }
 }
 
 export function placePoint(p: Pt, pl: SheetPlacement): Pt {
-  return { x: p.x * pl.scale + pl.offsetX, y: p.y * pl.scale + pl.offsetY }
+  return { x: p.x * pl.scaleX + pl.offsetX, y: p.y * pl.scaleY + pl.offsetY }
 }
 
 export type ExportMeta = {
@@ -85,6 +128,11 @@ export function exportPlt(steps: CutStep[], cfg: ExportCfg, sheet: Sheet, meta: 
     `CO"paper=${meta.material.paper} force=${meta.material.force} speed=${meta.material.speedMmS}mm/s passes=${meta.passes} bridge=${meta.bridgeWidthMm}mm";`,
   )
   lines.push(`CO"sheet=${meta.sheet.widthMm}x${meta.sheet.heightMm}mm origin=bottom_left unit=${cfg.unit} scale=${cfg.scale}";`)
+  if (pl.profile) {
+    lines.push(
+      `CO"calib=${sanitize(pl.profile.machine)}/${sanitize(pl.profile.paper)} sx=${pl.profile.scaleX} sy=${pl.profile.scaleY} ox=${pl.profile.offsetXMm} oy=${pl.profile.offsetYMm}mm";`,
+    )
+  }
 
   let runCount = 0
   let pointCount = 0
@@ -153,6 +201,9 @@ export function exportGcode(steps: CutStep[], cfg: ExportCfg, sheet: Sheet, meta
   lines.push(`; project=${meta.projectName} form=${meta.formName}`)
   lines.push(`; paper=${meta.material.paper} force=${meta.material.force} speed=${meta.material.speedMmS}mm/s passes=${passes}`)
   lines.push(`; sheet=${meta.sheet.widthMm}x${meta.sheet.heightMm}mm origin=${cfg.origin} scale=${cfg.scale}`)
+  if (pl.profile) {
+    lines.push(`; calib=${pl.profile.machine}/${pl.profile.paper} sx=${pl.profile.scaleX} sy=${pl.profile.scaleY} ox=${pl.profile.offsetXMm} oy=${pl.profile.offsetYMm}mm`)
+  }
   lines.push('G21 ; mm')
   lines.push('G90 ; absolute')
   lines.push('G0 Z0 ; blade up')
@@ -235,7 +286,7 @@ export function exportSvg(steps: CutStep[], cfg: ExportCfg, sheet: Sheet, meta: 
     '<?xml version="1.0" encoding="UTF-8"?>',
     `<svg xmlns="http://www.w3.org/2000/svg" width="${sheet.widthMm}mm" height="${sheet.heightMm}mm" viewBox="0 0 ${sheet.widthMm} ${sheet.heightMm}">`,
     `  <title>${escapeXml(meta.projectName)} - 剪纸刀路（含连刀点）</title>`,
-    `  <desc>bridge=${meta.bridgeWidthMm}mm sheet=${sheet.widthMm}x${sheet.heightMm}mm cut=${meta.cutLengthMm.toFixed(1)}mm origin=${cfg.origin} scale=${cfg.scale}</desc>`,
+    `  <desc>bridge=${meta.bridgeWidthMm}mm sheet=${sheet.widthMm}x${sheet.heightMm}mm cut=${meta.cutLengthMm.toFixed(1)}mm origin=${cfg.origin} scale=${cfg.scale}${pl.profile ? ` calib=${pl.profile.machine}/${pl.profile.paper} sx=${pl.profile.scaleX} sy=${pl.profile.scaleY}` : ''}</desc>`,
     `  <rect x="0" y="0" width="${sheet.widthMm}" height="${sheet.heightMm}" fill="none" stroke="#cccccc" stroke-width="0.1"/>`,
     '  <g fill="none" stroke="#c0392b" stroke-width="0.25" stroke-linecap="round" stroke-linejoin="round">',
     ...paths,
@@ -260,6 +311,48 @@ export function exportSvg(steps: CutStep[], cfg: ExportCfg, sheet: Sheet, meta: 
     repeatPasses: meta.passes,
     feedMmPerMin: meta.material.speedMmS * 60,
   }
+}
+
+/**
+ * 校准试切件 SVG（1:1）。入参 steps 为内部坐标（左上原点、y 向下），
+ * 图中按物理摆放（机器左下原点）绘制，整体做 y′ = H − y 翻转。
+ */
+export function buildCalibSheet(
+  steps: CutStep[],
+  sheet: Sheet,
+  info: { machine: string; paper: string; stdXMm: number; stdYMm: number; marginMm: number },
+): string {
+  const f = (v: number) => (Math.round(v * 1000) / 1000).toString()
+  const H = sheet.heightMm
+  // 内部（y 向下）→ 物理显示（左下原点）：y′ = H − y
+  const Y = (y: number) => H - y
+  const paths: string[] = []
+  for (const st of steps) {
+    const q = st.points.map((p) => ({ x: p.x, y: Y(p.y) }))
+    let d = `M${f(q[0].x)} ${f(q[0].y)}`
+    for (let i = 1; i < q.length; i++) d += `L${f(q[i].x)} ${f(q[i].y)}`
+    paths.push(`    <path d="${d}" />`)
+  }
+  const x0 = info.marginMm
+  const y0 = info.marginMm
+  const label = (x: number, y: number, text: string, anchor: 'start' | 'middle' | 'end' = 'start', size = 3) =>
+    `<text x="${f(x)}" y="${f(y)}" font-size="${size}" text-anchor="${anchor}" font-family="sans-serif" fill="#c0392b">${escapeXml(text)}</text>`
+  return [
+    '<?xml version="1.0" encoding="UTF-8"?>',
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${sheet.widthMm}mm" height="${sheet.heightMm}mm" viewBox="0 0 ${sheet.widthMm} ${sheet.heightMm}">`,
+    `  <title>校准试切件 ${escapeXml(info.machine)} / ${escapeXml(info.paper)}</title>`,
+    `  <desc>stdX=${info.stdXMm}mm stdY=${info.stdYMm}mm margin=${info.marginMm}mm origin=bottom_left（1:1 打印或直接切割，请勿缩放）</desc>`,
+    `  <rect x="0" y="0" width="${sheet.widthMm}" height="${sheet.heightMm}" fill="none" stroke="#cccccc" stroke-width="0.1"/>`,
+    `  <circle cx="${f(x0)}" cy="${f(y0)}" r="0.8" fill="#c0392b"/>`,
+    '  <g fill="none" stroke="#c0392b" stroke-width="0.25" stroke-linecap="round">',
+    ...paths,
+    '  </g>',
+    `  <g>${label(x0 + info.stdXMm / 2, y0 - 5, `横向标准线 ${info.stdXMm}mm（量两刻度内侧全长）`, 'middle')}`,
+    `    ${label(x0 + 4, y0 + info.stdYMm / 2, `纵向标准线 ${info.stdYMm}mm`, 'start')}</g>`,
+    `  ${label(x0, y0 + 4, `角点指令坐标 (${x0}, ${y0})mm｜量横线到纸左缘、竖线到纸下缘`, 'start', 2.6)}`,
+    '</svg>',
+    '',
+  ].join('\n')
 }
 
 /** A4 排版检查图（1:1，含 100mm 校验尺）；返回可打印的 SVG 字符串 */
@@ -340,6 +433,9 @@ export function buildA4Sheet(
     `纸幅：${sheet.widthMm}×${sheet.heightMm}mm（1:1 打印，请勿缩放）`,
     `材料：${meta.material.name}｜刀压 ${meta.material.force}｜速度 ${meta.material.speedMmS}mm/s｜重复 ${meta.passes} 次`,
     `连刀点宽 ${meta.bridgeWidthMm}mm｜刀路总长 ${meta.cutLengthMm.toFixed(1)}mm｜跳刀 ${meta.travelMm.toFixed(1)}mm`,
+    pl.profile
+      ? `校准：${pl.profile.machine}/${pl.profile.paper} sX=${pl.profile.scaleX} sY=${pl.profile.scaleY} 原点=${pl.profile.offsetXMm},${pl.profile.offsetYMm}mm（已按档案补偿）`
+      : '校准：未使用档案（按设计原样）',
     `切割段数 ${steps.length}｜原点 左下`,
   ]
   info.forEach((line, i) => {
