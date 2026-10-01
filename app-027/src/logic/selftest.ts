@@ -5,8 +5,18 @@ import { cleanupContours } from './cleanup'
 import { importSvgText } from './importer'
 import { computeShape } from './pipeline'
 import { buildJob } from './job'
-import { buildA4Sheet, computePlacement, exportGcode, exportPlt, type ExportMeta } from './exporters'
+import { buildA4Sheet, computePlacement, exportGcode, exportPlt, placePoint, type ExportMeta, affineYUpToYDown } from './exporters'
 import { polygonArea, polylineLength } from './geometry'
+import {
+  assessCalibration,
+  buildCalibrationArtifact,
+  computeCalibration,
+  defaultNominal,
+  paperKeyOf,
+  assessProfileUse,
+} from './calibration'
+import type { CalibrationHistoryEntry, CalibrationProfile } from './calibration'
+import { IDENTITY_AFFINE } from './types'
 
 export type CheckResult = {
   id: string
@@ -332,7 +342,8 @@ export async function runSelfTest(settings: CutSettings = DEFAULT_CUT_SETTINGS, 
     let exportYOfMax = 0
     for (const st of job.steps) {
       for (const p of st.points) {
-        const y = p.y + pl.offsetY
+        // 经公共摆放 API（补偿仿射 + 边距）得到内部 y，再翻到左下原点
+        const y = placePoint(p, pl).y
         if (y > maxInternalY) {
           maxInternalY = y
           exportYOfMax = Math.round((sheet.heightMm - y) / 0.025)
@@ -450,6 +461,129 @@ export async function runSelfTest(settings: CutSettings = DEFAULT_CUT_SETTINGS, 
       '刀补超出轮廓尺度时明确警告并保留原路径（不输出坏路径）',
       !tinyOk && tinyMsg.includes('原路径') && tinyRuns > 0,
       `0.3mm 细长条（内层，向内侧偏置 ${mat.bladeOffsetMm}mm）：${tinyMsg}｜仍输出 ${tinyRuns} 段原路径`,
+    ),
+  )
+
+  // ---------- 10. 机器 × 纸张校准 ----------
+  const calSheet = { widthMm: 210, heightMm: 297, name: 'A4 纵向' }
+  const nom = defaultNominal(calSheet)
+  // 模拟机器 px = sx·qx + ox、py = sy·qy + oy（切小 + 纸角原点偏移）
+  const mSx = 0.982
+  const mSy = 0.971
+  const mOx = 0.45
+  const mOy = -0.3
+  const calMeasured = {
+    lenX: nom.lenX * mSx,
+    lenY: nom.lenY * mSy,
+    originX: mSx * nom.originX + mOx,
+    originY: mSy * nom.originY + mOy,
+  }
+  const cal = computeCalibration(nom, calMeasured)
+  const estOk = Math.abs(cal.sx - mSx) < 1e-9 && Math.abs(cal.sy - mSy) < 1e-9 && Math.abs(cal.ox - mOx) < 1e-6 && Math.abs(cal.oy - mOy) < 1e-6
+  checks.push(
+    ok(
+      'calibration-solve',
+      '校准反解：由横/竖实测长度与原点位置正确算出 sx/sy 与纸角原点偏差',
+      estOk,
+      `名义 ${nom.lenX}/${nom.lenY}mm、起点(${nom.originX},${nom.originY}) → sx ${cal.sx}（真 ${mSx}）｜sy ${cal.sy}（真 ${mSy}）｜ox ${cal.ox}mm｜oy ${cal.oy}mm`,
+    ),
+  )
+
+  // 补偿圆程：摆放后下发指令，经同一台机器物理映射，应精确等于期望物理位置
+  const calSteps = [
+    {
+      points: [
+        { x: 20, y: 40 },
+        { x: 120, y: 40 },
+        { x: 120, y: 200 },
+        { x: 20, y: 200 },
+      ],
+      closed: true,
+    },
+  ]
+  const calMargin = 10
+  const calPl = computePlacement(calSteps as never, calSheet, 1, calMargin, cal.comp)
+  let calRoundtrip = 0
+  const bMinX = 20
+  const bMinY = 40
+  for (const p of calSteps[0].points) {
+    const qd = { x: p.x * calPl.compDown.kx + calPl.compDown.tx, y: p.y * calPl.compDown.ky + calPl.compDown.ty }
+    const px = mSx * qd.x + mOx
+    const py = mSy * (calSheet.heightMm - qd.y) + mOy
+    const wantX = calMargin + p.x - bMinX
+    const wantY = calSheet.heightMm - (calMargin + p.y - bMinY)
+    calRoundtrip = Math.max(calRoundtrip, Math.abs(px - wantX), Math.abs(py - wantY))
+  }
+  // y 向下仿射换算：身份仿射翻转后仍为身份；通用例 ty_down = H − (ky·H + ty)
+  const flipIdentity = affineYUpToYDown(IDENTITY_AFFINE, calSheet.heightMm)
+  const flipOk =
+    flipIdentity.kx === 1 && flipIdentity.ky === 1 && flipIdentity.tx === 0 && flipIdentity.ty === 0 &&
+    Math.abs(affineYUpToYDown({ kx: 2, ky: 3, tx: 4, ty: 5 }, 100).ty - (100 - (300 + 5))) < 1e-9
+  checks.push(
+    ok(
+      'calibration-roundtrip',
+      '导出补偿：整张图按档案预补偿后，经机器缩放/原点误差物理还原到设计位置（误差 < 0.001mm），且 y 翻转仿射换算正确',
+      calRoundtrip < 0.001 && flipOk,
+      `补偿后下发指令经机器映射，最大位置残差 ${calRoundtrip.toFixed(6)}mm｜y 上→下仿射换算 ${flipOk ? '正确' : '错误'}｜身份档案摆放与旧公式一致`,
+    ),
+  )
+
+  // 试切件：名义线条必须以原始（无补偿）HPGL 坐标输出，且在纸幅内
+  const artifact = buildCalibrationArtifact(nom, '自检机', '卡纸')
+  const hpgl = 0.025
+  const hx0 = Math.round(nom.originX / hpgl)
+  const hy0 = Math.round(nom.originY / hpgl)
+  const hx1 = Math.round((nom.originX + nom.lenX) / hpgl)
+  const hy1 = Math.round((nom.originY + nom.lenY) / hpgl)
+  const hasH = artifact.plt.includes(`PU${hx0},${hy0};PD${hx1},${hy0};`)
+  const hasV = artifact.plt.includes(`PU${hx0},${hy0};PD${hx0},${hy1};`)
+  const inSheetA = hx0 >= 0 && hy0 >= 0 && hx1 <= calSheet.widthMm / hpgl && hy1 <= calSheet.heightMm / hpgl
+  const guideOk = artifact.guideSvg.includes(`width="${calSheet.widthMm}mm"`) && artifact.guideSvg.includes(`height="${calSheet.heightMm}mm"`)
+  checks.push(
+    ok(
+      'calibration-artifact',
+      '试切件：横/竖标准长度按名义尺寸无补偿输出（原始 HPGL，原点左下），带端点刻度并在纸幅内，附 1:1 说明书',
+      hasH && hasV && inSheetA && guideOk,
+      `横线 PU${hx0},${hy0} PD${hx1},${hy0}｜竖线 PD${hx0},${hy1}｜纸幅内 ${inSheetA}｜说明书 SVG ${guideOk}`,
+    ),
+  )
+
+  // 超阈值提醒而不是悄悄套用 + 换纸不匹配拦截
+  const goodEntry: CalibrationHistoryEntry = {
+    at: Date.now(),
+    note: '',
+    nominal: nom,
+    measured: { lenX: nom.lenX, lenY: nom.lenY, originX: nom.originX, originY: nom.originY },
+    sx: 1,
+    sy: 1,
+    ox: 0,
+    oy: 0,
+    comp: IDENTITY_AFFINE,
+  }
+  const badEntry: CalibrationHistoryEntry = { ...goodEntry, sx: 1.05, sy: 0.96, comp: { kx: 1 / 1.05, ky: 1 / 0.96, tx: 0, ty: 0 } }
+  const goodProfile: CalibrationProfile = {
+    id: 'cal_good',
+    machine: '自检机',
+    paperLabel: '卡纸',
+    paperKey: paperKeyOf('cardstock', calSheet),
+    sheet: calSheet,
+    createdAt: 0,
+    updatedAt: 0,
+    current: goodEntry,
+    history: [],
+    warnPct: 2,
+  }
+  const badProfile: CalibrationProfile = { ...goodProfile, id: 'cal_bad', current: badEntry }
+  const goodStatus = assessCalibration(goodEntry, calSheet, 2)
+  const badStatus = assessCalibration(badEntry, calSheet, 2)
+  const mismatchStatus = assessProfileUse(goodProfile, { widthMm: 400, heightMm: 600, name: '宣纸' }, paperKeyOf('xuan', { widthMm: 400, heightMm: 600, name: '宣纸' }))
+  const badProfileWarns = assessProfileUse(badProfile, calSheet, goodProfile.paperKey).level === 'warn'
+  checks.push(
+    ok(
+      'calibration-warn',
+      '偏差超过阈值要提醒重新校准、换纸/纸幅不匹配要拦截，而不是悄悄套用旧档案',
+      goodStatus.level === 'ok' && badStatus.level === 'warn' && mismatchStatus.level === 'bad' && badProfileWarns,
+      `准确档案=${goodStatus.level}｜±5% 偏差档案=${badStatus.level}（${badStatus.messages[0]?.slice(0, 24)}…）｜换纸+换纸幅=${mismatchStatus.level}（共 ${mismatchStatus.messages.length} 条提醒）`,
     ),
   )
 

@@ -7,6 +7,7 @@ import type { CutStep } from '@/logic/order'
 import { closestOnPolyline, boundsOf, mergeBounds } from '@/logic/geometry'
 import type { SheetPlacement } from '@/logic/exporters'
 import { placePoint } from '@/logic/exporters'
+import type { AxisAffine } from '@/logic/types'
 
 type Mode = 'outline' | 'toolpath' | 'bridge'
 type Tool = 'select' | 'rect' | 'circle' | 'polygon' | 'bridge' | 'pan'
@@ -28,6 +29,9 @@ const props = withDefaults(
     simIndex?: number
     placement?: SheetPlacement | null
     statusText?: string
+    /** 补偿预览：在设计轮廓上叠加按此仿射（设计空间）补偿后的轮廓 */
+    overlayComp?: AxisAffine | null
+    overlayLabel?: string
   }>(),
   {
     job: null,
@@ -43,6 +47,8 @@ const props = withDefaults(
     simIndex: -1,
     placement: null,
     statusText: '',
+    overlayComp: null,
+    overlayLabel: '',
   },
 )
 
@@ -327,6 +333,21 @@ const outlineContours = computed<DrawContour[]>(() => {
   return out
 })
 
+/** 补偿预览：仿射后的设计轮廓（与未补偿轮廓叠加，直观看差多少） */
+const overlayContours = computed<Array<{ id: string; d: string }>>(() => {
+  const a = props.overlayComp
+  if (!a || (a.kx === 1 && a.ky === 1 && a.tx === 0 && a.ty === 0)) return []
+  const out: Array<{ id: string; d: string }> = []
+  for (const s of props.shapes) {
+    for (const c of s.contours) {
+      if (c.points.length < 2) continue
+      const pts = c.points.map((p) => ({ x: p.x * a.kx + a.tx, y: p.y * a.ky + a.ty }))
+      out.push({ id: `ov-${c.id}`, d: pointsToD(pts, c.closed) })
+    }
+  }
+  return out
+})
+
 const pl = (p: Pt): Pt => (props.placement ? placePoint(p, props.placement) : p)
 
 const cutSteps = computed<CutStep[]>(() => {
@@ -530,6 +551,19 @@ function focusContour(id: string): void {
             :stroke="c.color"
             :stroke-dasharray="c.dash"
             :stroke-width="c.width"
+            vector-effect="non-scaling-stroke"
+          />
+        </g>
+
+        <!-- 补偿后轮廓预览（与未补偿轮廓叠加，直观看差多少） -->
+        <g v-if="overlayComp && overlayContours.length" fill="none" stroke-linecap="round" stroke-linejoin="round">
+          <path
+            v-for="c in overlayContours"
+            :key="c.id"
+            :d="c.d"
+            stroke="#47c07a"
+            stroke-width="1.1"
+            stroke-dasharray="6 3"
             vector-effect="non-scaling-stroke"
           />
         </g>

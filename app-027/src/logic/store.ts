@@ -17,6 +17,7 @@ import { buildBatchShape, buildJob, type Job } from './job'
 import { uid } from './geometry'
 import { importSvgText, type ImportResult } from './importer'
 import { defaultMaterials } from '@/data/materials'
+import type { CalibrationProfile } from './calibration'
 
 const LS_KEY = 'papercut-plotter-studio/v1'
 
@@ -24,11 +25,14 @@ type Persisted = {
   version: number
   projects: Project[]
   materials: MaterialPreset[]
+  calibrations: CalibrationProfile[]
 }
 
 type StoreState = {
   projects: Project[]
   materials: MaterialPreset[]
+  /** 机器 × 纸张校准档案（含已归档的历史档案） */
+  calibrations: CalibrationProfile[]
   ready: boolean
   lastError: string | null
 }
@@ -36,6 +40,7 @@ type StoreState = {
 export const state = reactive<StoreState>({
   projects: [],
   materials: [],
+  calibrations: [],
   ready: false,
   lastError: null,
 })
@@ -68,6 +73,9 @@ export function loadState(): void {
       if (parsed && Array.isArray(parsed.materials) && parsed.materials.length > 0) {
         state.materials = parsed.materials.map((m) => ({ ...m, backing: m.backing ?? '常规垫板' }))
       }
+      if (parsed && Array.isArray(parsed.calibrations)) {
+        state.calibrations = parsed.calibrations.map(normalizeCalibration)
+      }
     }
   } catch (e) {
     state.lastError = `本地数据读取失败：${(e as Error).message}`
@@ -79,7 +87,12 @@ export function loadState(): void {
 export function saveNow(): void {
   if (!canUseStorage()) return
   try {
-    const data: Persisted = { version: 1, projects: state.projects, materials: state.materials }
+    const data: Persisted = {
+      version: 1,
+      projects: state.projects,
+      materials: state.materials,
+      calibrations: state.calibrations,
+    }
     localStorage.setItem(LS_KEY, JSON.stringify(data))
   } catch (e) {
     state.lastError = `本地保存失败：${(e as Error).message}`
@@ -106,6 +119,18 @@ function normalizeProject(p: Project): Project {
       contours: (s.contours ?? []).map((c) => ({ ...c, holes: c.holes ?? [], bridges: c.bridges ?? [], warnings: c.warnings ?? [] })),
     })),
     layerNames: p.layerNames ?? ['图层 1'],
+    calibrationId: p.calibrationId ?? null,
+  }
+}
+
+function normalizeCalibration(c: CalibrationProfile): CalibrationProfile {
+  return {
+    ...c,
+    history: Array.isArray(c.history) ? c.history : [],
+    archived: c.archived ?? false,
+    note: c.note ?? '',
+    warnPct: c.warnPct ?? 2,
+    sheet: c.sheet ?? { ...DEFAULT_SHEET },
   }
 }
 
@@ -199,6 +224,7 @@ function newProject(name: string, shapes: Shape[]): Project {
     sheet: { ...DEFAULT_SHEET },
     materialId: state.materials[0]?.id ?? '',
     layerNames: ['图层 1'],
+    calibrationId: null,
     batch: { enabled: false, rows: 2, cols: 2, gapXMm: 5, gapYMm: 5, sharedEdge: false, mode: 'repeat' },
   }
 }
@@ -409,6 +435,77 @@ export function applySymmetry(p: Project, shapeId: string, op: 'mirror_x' | 'mir
   touch(p)
 }
 
+// ---------------- 机器校准档案 ----------------
+
+/** 当前生效（未归档）的档案 */
+export function activeCalibrations(): CalibrationProfile[] {
+  return state.calibrations.filter((c) => !c.archived)
+}
+
+export function getCalibration(id: string | null | undefined): CalibrationProfile | null {
+  if (!id) return null
+  return state.calibrations.find((c) => c.id === id) ?? null
+}
+
+/** 项目选中的档案；已删除 / 已归档时返回 null（调用方应提示重新选择） */
+export function calibrationOfProject(p: Project): CalibrationProfile | null {
+  return getCalibration(p.calibrationId)
+}
+
+export function setProjectCalibration(p: Project, id: string | null): void {
+  p.calibrationId = id
+  touch(p)
+}
+
+/** 新建档案（第一次校准） */
+export function createCalibration(profile: CalibrationProfile): void {
+  state.calibrations.unshift(profile)
+  scheduleSave()
+}
+
+/**
+ * 再校准同一台机器 + 同一种纸：当前记录转入 history 留档，新记录成为 current。
+ * 一台机器一种纸只保留一条生效档案。
+ */
+export function recalibrate(id: string, entry: CalibrationProfile['current']): CalibrationProfile | null {
+  const c = state.calibrations.find((x) => x.id === id)
+  if (!c) return null
+  c.history = [c.current, ...c.history].slice(0, 50)
+  c.current = entry
+  c.updatedAt = entry.at
+  c.sheet = { ...entry.nominal.sheet }
+  scheduleSave()
+  return c
+}
+
+/** 纸张变化后另存为新档案（旧档案归档留档，便于对比换纸前后差异） */
+export function archiveCalibration(id: string): void {
+  const c = state.calibrations.find((x) => x.id === id)
+  if (c) {
+    c.archived = true
+    scheduleSave()
+  }
+}
+
+export function restoreCalibration(id: string): void {
+  const c = state.calibrations.find((x) => x.id === id)
+  if (c) {
+    c.archived = false
+    scheduleSave()
+  }
+}
+
+export function deleteCalibration(id: string): void {
+  const i = state.calibrations.findIndex((x) => x.id === id)
+  if (i >= 0) {
+    state.calibrations.splice(i, 1)
+    for (const p of state.projects) {
+      if (p.calibrationId === id) p.calibrationId = null
+    }
+    scheduleSave()
+  }
+}
+
 // ---------------- 材料预设 ----------------
 
 export function upsertMaterial(m: MaterialPreset): void {
@@ -451,7 +548,7 @@ export function addImportedShapes(p: Project, shapes: Shape[]): void {
 }
 
 watch(
-  () => [state.projects, state.materials],
+  () => [state.projects, state.materials, state.calibrations],
   () => {
     if (state.ready) scheduleSave()
   },
@@ -492,4 +589,13 @@ export const store = {
   recomputeAll,
   importSvgToShapes,
   touch,
+  activeCalibrations,
+  getCalibration,
+  calibrationOfProject,
+  setProjectCalibration,
+  createCalibration,
+  recalibrate,
+  archiveCalibration,
+  restoreCalibration,
+  deleteCalibration,
 }

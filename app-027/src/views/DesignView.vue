@@ -9,6 +9,8 @@ import type { ComputedShape } from '@/logic/pipeline'
 import { makeContour } from '@/logic/cleanup'
 import { dist, uid } from '@/logic/geometry'
 import { arcToCubics, sampleCubicInto } from '@/logic/svg'
+import { assessProfileUse, paperKeyOf } from '@/logic/calibration'
+import type { AxisAffine } from '@/logic/types'
 
 type Mode = 'outline' | 'toolpath' | 'bridge'
 type Tool = 'select' | 'pan' | 'rect' | 'circle' | 'polygon' | 'bridge'
@@ -332,6 +334,51 @@ const computedMap = computed(() => {
   }
   return m
 })
+
+// ---------------- 机器校准补偿预览 ----------------
+
+const showCompOverlay = ref(true)
+const calibration = computed(() => (project.value ? store.calibrationOfProject(project.value) : null))
+const calibrationAssess = computed(() => {
+  const p = project.value
+  const c = calibration.value
+  if (!p || !c) return null
+  const m = store.materialOf(p)
+  return assessProfileUse(c, p.sheet, m ? paperKeyOf(m.paper, p.sheet) : undefined)
+})
+
+/**
+ * 预览叠加用的设计空间仿射：以全部纹样包围盒中心为不动点应用 kx/ky，
+ * 原点平移只做提示性放大（单位 mm，按画布比例即可看出差多少）。
+ */
+const overlayComp = computed<AxisAffine | null>(() => {
+  if (!showCompOverlay.value || !calibration.value || mode.value !== 'outline') return null
+  const a = calibration.value.current.comp
+  if (a.kx === 1 && a.ky === 1) return null
+  const all = shapes.value.flatMap((s) => s.contours.flatMap((c) => c.points))
+  if (all.length === 0) return null
+  let minX = Infinity
+  let minY = Infinity
+  let maxX = -Infinity
+  let maxY = -Infinity
+  for (const p of all) {
+    minX = Math.min(minX, p.x)
+    minY = Math.min(minY, p.y)
+    maxX = Math.max(maxX, p.x)
+    maxY = Math.max(maxY, p.y)
+  }
+  const cx = (minX + maxX) / 2
+  const cy = (minY + maxY) / 2
+  // 绕中心缩放，使两轮廓同心、差异一目了然
+  return { kx: a.kx, ky: a.ky, tx: cx * (1 - a.kx), ty: cy * (1 - a.ky) }
+})
+
+const overlayHint = computed(() => {
+  const c = calibration.value
+  if (!c) return ''
+  const a = c.current.comp
+  return `绿虚线 = 按「${c.machine} · ${c.paperLabel}」补偿后的轮廓（kₓ ${a.kx} / k_y ${a.ky}），白实线为未补偿设计`
+})
 </script>
 
 <template>
@@ -427,7 +474,8 @@ const computedMap = computed(() => {
         :show-travel="mode === 'toolpath'"
         :magnify="true"
         :selected-contour-id="selectedContourId"
-        :status-text="mode === 'bridge' ? '缺口已放大 8 倍' : ''"
+        :overlay-comp="overlayComp"
+        :status-text="overlayComp ? overlayHint : mode === 'bridge' ? '缺口已放大 8 倍' : ''"
         @select-contour="onSelectContour"
         @create-rect="onRect"
         @create-circle="onCircle"
@@ -437,7 +485,8 @@ const computedMap = computed(() => {
       />
       <div class="panel-foot">
         <div class="legend">
-          <span v-if="mode === 'outline'"><i style="background: #cfd9e4"></i>轮廓</span>
+          <span v-if="mode === 'outline'"><i style="background: #cfd9e4"></i>轮廓（未补偿）</span>
+          <span v-if="mode === 'outline' && overlayComp"><i style="background: #47c07a"></i>补偿后预览</span>
           <span><i style="background: #ffc857"></i>未闭合</span>
           <span><i style="background: #ff6b6b"></i>自交</span>
           <span><i style="background: #b48cff"></i>重复路径</span>
@@ -566,6 +615,26 @@ const computedMap = computed(() => {
         </div>
 
         <div class="section">
+          <div class="section-title">机器校准补偿预览</div>
+          <label class="check"><input type="checkbox" v-model="showCompOverlay" :disabled="!calibration" /> 在成品轮廓上叠加补偿后形状（绿虚线）</label>
+          <div v-if="!calibration" class="hint">
+            未选择校准档案。这台机器切出来若比设计小或换过纸种，请先做校准。
+          </div>
+          <template v-else>
+            <div class="hint">
+              {{ calibration.machine }} · {{ calibration.paperLabel }}｜
+              sₓ {{ calibration.current.sx.toFixed(4) }} / s_y {{ calibration.current.sy.toFixed(4) }}｜
+              原点 oₓ {{ calibration.current.ox.toFixed(2) }} / o_y {{ calibration.current.oy.toFixed(2) }}mm
+            </div>
+            <div v-for="(m, i) in calibrationAssess?.messages ?? []" :key="i" class="banner" :class="calibrationAssess!.level === 'bad' ? 'err' : 'warn'">{{ m }}</div>
+          </template>
+          <div class="btn-row" style="margin-top: 6px">
+            <button class="tiny" @click="router.push(`/calibration/${project.id}`)">新建 / 管理校准</button>
+            <button class="tiny" @click="router.push(`/export/${project.id}`)">去导出页选择档案</button>
+          </div>
+        </div>
+
+        <div class="section">
           <div class="section-title">材料</div>
           <select :value="project.materialId" @change="store.setMaterial(project, ($event.target as HTMLSelectElement).value)">
             <option v-for="m in state.materials" :key="m.id" :value="m.id">{{ m.name }}</option>
@@ -594,6 +663,16 @@ const computedMap = computed(() => {
   background: rgba(255, 107, 107, 0.12);
   border: 1px solid rgba(255, 107, 107, 0.4);
   color: #ffb3b3;
+  padding: 6px 8px;
+  border-radius: 5px;
+  margin-bottom: 8px;
+  font-size: 12px;
+}
+
+.banner.warn {
+  background: rgba(255, 200, 87, 0.12);
+  border: 1px solid rgba(255, 200, 87, 0.4);
+  color: #ffd98a;
   padding: 6px 8px;
   border-radius: 5px;
   margin-bottom: 8px;

@@ -1,5 +1,7 @@
-import type { ExportCfg, MaterialPreset, Pt, Sheet } from './types'
+import type { AxisAffine, ExportCfg, MaterialPreset, Pt, Sheet } from './types'
+import { IDENTITY_AFFINE } from './types'
 import type { CutStep } from './order'
+import { applyAffine } from './calibration'
 import { boundsOf, dist } from './geometry'
 
 export type SheetPlacement = {
@@ -8,31 +10,99 @@ export type SheetPlacement = {
   offsetX: number
   offsetY: number
   scale: number
+  /** 导出补偿（指令空间，纸幅左下原点 y 向上） */
+  comp: AxisAffine
+  /** 换算到内部 / SVG 空间（左上原点 y 向下）后的补偿 */
+  compDown: AxisAffine
+  sheetHeightMm: number
   outOfSheet: boolean
   placedBounds: { minX: number; minY: number; maxX: number; maxY: number }
+  /** 补偿后、放边距后的指令坐标范围（纸幅左下原点，y 向上，mm） */
+  commandBounds: { minX: number; minY: number; maxX: number; maxY: number }
 }
 
 export const SHEET_MARGIN_MM = 10
 
-export function computePlacement(steps: CutStep[], sheet: Sheet, scale: number, marginMm = SHEET_MARGIN_MM): SheetPlacement {
+/**
+ * 校准补偿仿射定义在指令空间（纸幅左下原点，y 向上，HPGL 约定）；
+ * 内部摆放与 SVG 导出用左上原点、y 向下。轴缩放与 y 翻转可交换，
+ * 平移量需要换算：y_down = H − y_up，于是 t_down(y) = H − (ky·H + ty)。
+ */
+export function affineYUpToYDown(comp: AxisAffine, sheetH: number): AxisAffine {
+  return { kx: comp.kx, ky: comp.ky, tx: comp.tx, ty: sheetH - (comp.ky * sheetH + comp.ty) }
+}
+
+/**
+ * 计算摆放：先按校准档案做轴仿射补偿，再乘用户缩放并放进纸面边距。
+ *
+ * 机器物理模型 px = sx·qx + ox，设计点 x（原始、未补偿）希望切在
+ * margin + scale·(x − min) 的物理位置。代入解得下发指令：
+ *   qx = kx·scale·(x − b.minX) + kx·margin + tx，  kx = 1/sx，tx = −ox/sx
+ * 纵向在 y 向下空间对称（ox→ty_down、min 取 max，边距落在下边）。
+ * 即：摆放相对原始包围盒（不是补偿后包围盒），避免重新居中把原点补偿吃掉。
+ */
+export function computePlacement(
+  steps: CutStep[],
+  sheet: Sheet,
+  scale: number,
+  marginMm = SHEET_MARGIN_MM,
+  comp: AxisAffine = IDENTITY_AFFINE,
+): SheetPlacement {
   const pts: Pt[] = []
   for (const st of steps) pts.push(...st.points)
   const b = pts.length > 0 ? boundsOf(pts) : { minX: 0, minY: 0, maxX: 0, maxY: 0 }
-  const offsetX = marginMm - b.minX * scale
-  const offsetY = marginMm - b.minY * scale
-  const placed = {
-    minX: b.minX * scale + offsetX,
-    minY: b.minY * scale + offsetY,
-    maxX: b.maxX * scale + offsetX,
-    maxY: b.maxY * scale + offsetY,
+
+  const dc = affineYUpToYDown(comp, sheet.heightMm)
+
+  // 目标物理（y 向上）：Tx = margin + s·(px − b.minX)
+  //                    Ty = H − margin − s·(py − b.minY)
+  // 指令 Q = k·目标 + t；导出时 Qy 由内部 y 向下点经 qd.y = H − Qy 映射，复合得：
+  //   qd.x = kx·s·px + kx·(margin − s·b.minX) + tx
+  //   qd.y = ky·s·py + ky·(margin − s·b.minY) + H·(1−ky) − ty
+  // 身份仿射时退化为旧公式：margin + s·(坐标 − 包围盒最小值)。
+  const placeAffine: AxisAffine = {
+    kx: dc.kx * scale,
+    ky: dc.ky * scale,
+    tx: dc.kx * (marginMm - scale * b.minX) + comp.tx,
+    ty: dc.ky * (marginMm - scale * b.minY) + dc.ty,
+  }
+
+  // 补偿后实际下发指令（y 向下空间）的四角极值
+  const corners = [
+    applyAffine(b.minX, b.minY, placeAffine),
+    applyAffine(b.minX, b.maxY, placeAffine),
+    applyAffine(b.maxX, b.minY, placeAffine),
+    applyAffine(b.maxX, b.maxY, placeAffine),
+  ]
+  const cb = boundsOf(corners)
+
+  // placePoint 需要 (A, off=0) 形式，因此 offset 全并入仿射的 tx/ty
+  const placed = cb
+  const commandBounds = {
+    minX: placed.minX,
+    maxX: placed.maxX,
+    minY: sheet.heightMm - placed.maxY,
+    maxY: sheet.heightMm - placed.minY,
   }
   const outOfSheet =
     placed.minX < -0.01 || placed.minY < -0.01 || placed.maxX > sheet.widthMm + 0.01 || placed.maxY > sheet.heightMm + 0.01
-  return { marginMm, offsetX, offsetY, scale, outOfSheet, placedBounds: placed }
+  return {
+    marginMm,
+    offsetX: 0,
+    offsetY: 0,
+    scale,
+    comp,
+    compDown: placeAffine,
+    sheetHeightMm: sheet.heightMm,
+    outOfSheet,
+    placedBounds: placed,
+    commandBounds,
+  }
 }
 
+/** 设计点 → 纸幅坐标（内部左上 y 向下）：先补偿、再缩放、再放边距 */
 export function placePoint(p: Pt, pl: SheetPlacement): Pt {
-  return { x: p.x * pl.scale + pl.offsetX, y: p.y * pl.scale + pl.offsetY }
+  return applyAffine(p.x, p.y, pl.compDown)
 }
 
 export type ExportMeta = {
@@ -44,6 +114,8 @@ export type ExportMeta = {
   sheet: Sheet
   cutLengthMm: number
   travelMm: number
+  /** 校准档案标注（机器 / 纸张 / 缩放系数），写进文件头便于上机核对 */
+  calibrationLabel?: string | null
 }
 
 export type ExportStats = {
@@ -85,6 +157,7 @@ export function exportPlt(steps: CutStep[], cfg: ExportCfg, sheet: Sheet, meta: 
     `CO"paper=${meta.material.paper} force=${meta.material.force} speed=${meta.material.speedMmS}mm/s passes=${meta.passes} bridge=${meta.bridgeWidthMm}mm";`,
   )
   lines.push(`CO"sheet=${meta.sheet.widthMm}x${meta.sheet.heightMm}mm origin=bottom_left unit=${cfg.unit} scale=${cfg.scale}";`)
+  if (meta.calibrationLabel) lines.push(`CO"calibration=${sanitize(meta.calibrationLabel)}";`)
 
   let runCount = 0
   let pointCount = 0
@@ -153,6 +226,7 @@ export function exportGcode(steps: CutStep[], cfg: ExportCfg, sheet: Sheet, meta
   lines.push(`; project=${meta.projectName} form=${meta.formName}`)
   lines.push(`; paper=${meta.material.paper} force=${meta.material.force} speed=${meta.material.speedMmS}mm/s passes=${passes}`)
   lines.push(`; sheet=${meta.sheet.widthMm}x${meta.sheet.heightMm}mm origin=${cfg.origin} scale=${cfg.scale}`)
+  if (meta.calibrationLabel) lines.push(`; calibration=${meta.calibrationLabel}`)
   lines.push('G21 ; mm')
   lines.push('G90 ; absolute')
   lines.push('G0 Z0 ; blade up')
@@ -235,7 +309,7 @@ export function exportSvg(steps: CutStep[], cfg: ExportCfg, sheet: Sheet, meta: 
     '<?xml version="1.0" encoding="UTF-8"?>',
     `<svg xmlns="http://www.w3.org/2000/svg" width="${sheet.widthMm}mm" height="${sheet.heightMm}mm" viewBox="0 0 ${sheet.widthMm} ${sheet.heightMm}">`,
     `  <title>${escapeXml(meta.projectName)} - 剪纸刀路（含连刀点）</title>`,
-    `  <desc>bridge=${meta.bridgeWidthMm}mm sheet=${sheet.widthMm}x${sheet.heightMm}mm cut=${meta.cutLengthMm.toFixed(1)}mm origin=${cfg.origin} scale=${cfg.scale}</desc>`,
+    `  <desc>bridge=${meta.bridgeWidthMm}mm sheet=${sheet.widthMm}x${sheet.heightMm}mm cut=${meta.cutLengthMm.toFixed(1)}mm origin=${cfg.origin} scale=${cfg.scale}${meta.calibrationLabel ? ` calibration=${escapeXml(meta.calibrationLabel)}` : ''}</desc>`,
     `  <rect x="0" y="0" width="${sheet.widthMm}" height="${sheet.heightMm}" fill="none" stroke="#cccccc" stroke-width="0.1"/>`,
     '  <g fill="none" stroke="#c0392b" stroke-width="0.25" stroke-linecap="round" stroke-linejoin="round">',
     ...paths,
@@ -342,6 +416,7 @@ export function buildA4Sheet(
     `连刀点宽 ${meta.bridgeWidthMm}mm｜刀路总长 ${meta.cutLengthMm.toFixed(1)}mm｜跳刀 ${meta.travelMm.toFixed(1)}mm`,
     `切割段数 ${steps.length}｜原点 左下`,
   ]
+  if (meta.calibrationLabel) info.push(`机器校准：${meta.calibrationLabel}（刀路已按档案预补偿）`)
   info.forEach((line, i) => {
     parts.push(
       `<text x="${f(pl.marginMm)}" y="${f(sheet.heightMm - 26 + i * 3.4)}" font-size="2.8" font-family="sans-serif" fill="#000">${escapeXml(line)}</text>`,

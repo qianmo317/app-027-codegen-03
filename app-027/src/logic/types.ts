@@ -64,6 +64,14 @@ export type ExportCfg = {
   scale: number
 }
 
+/**
+ * 轴仿射补偿（输出指令空间，纸幅左下原点，y 向上，单位 mm）。
+ * physical = (k^-1 意义见 calibration.ts)：指令坐标 q = k·设计物理坐标 + t。
+ */
+export type AxisAffine = { kx: number; ky: number; tx: number; ty: number }
+
+export const IDENTITY_AFFINE: AxisAffine = { kx: 1, ky: 1, tx: 0, ty: 0 }
+
 export type Sheet = { widthMm: number; heightMm: number; name: string }
 
 /** 项目（保存到本地存储） */
@@ -83,6 +91,8 @@ export type Project = {
   batch?: BatchCfg
   /** 批量排版的对象形状（同一纹样排满一张纸） */
   batchShapeId?: string
+  /** 选中的机器校准档案 id（机器 + 纸张一条）；空表示不补偿 */
+  calibrationId?: string | null
 }
 
 export type BatchCfg = {

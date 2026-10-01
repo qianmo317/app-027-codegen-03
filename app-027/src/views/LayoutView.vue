@@ -38,13 +38,14 @@ const computedMap = computed(() => {
 const placement = computed(() => {
   const p = project.value
   if (!p || !job.value) return null
-  return computePlacement(job.value.steps, p.sheet, p.export.scale)
+  const cal = store.calibrationOfProject(p)
+  return computePlacement(job.value.steps, p.sheet, p.export.scale, SHEET_MARGIN_MM, cal?.current.comp)
 })
 
-/** 纸幅是否放得下 */
+/** 纸幅是否放得下（以补偿后实际下发范围为准） */
 const fitInfo = computed(() => {
   const p = project.value
-  if (!p || !job.value) return null
+  if (!p || !job.value || !placement.value) return null
   const pts: Pt[] = []
   for (const st of job.value.steps) pts.push(...st.points)
   if (pts.length === 0) return null
@@ -53,8 +54,24 @@ const fitInfo = computed(() => {
   const h = (b.maxY - b.minY) * p.export.scale
   const availW = p.sheet.widthMm - SHEET_MARGIN_MM * 2
   const availH = p.sheet.heightMm - SHEET_MARGIN_MM * 2
+  const cb = placement.value.commandBounds
+  const compW = cb.maxX - cb.minX
+  const compH = cb.maxY - cb.minY
   const fits = w <= availW + 0.01 && h <= availH + 0.01
-  return { w, h, availW, availH, fits, suggestScale: fits ? p.export.scale : Math.min(availW / (b.maxX - b.minX || 1), availH / (b.maxY - b.minY || 1)) }
+  const compFits = !placement.value.outOfSheet
+  // 自动适配：补偿后范围与当前缩放近似成正比，按 新缩放 = 当前缩放·min(可用/补偿后) 反推
+  const suggestScale = p.export.scale * Math.min(availW / Math.max(compW, 1e-6), availH / Math.max(compH, 1e-6))
+  return {
+    w,
+    h,
+    compW,
+    compH,
+    availW,
+    availH,
+    fits,
+    compFits,
+    suggestScale: fits && compFits ? p.export.scale : suggestScale,
+  }
 })
 
 function autoFit(): void {
@@ -63,6 +80,14 @@ function autoFit(): void {
   if (!p || !f) return
   store.updateExport(p, { scale: Math.max(0.05, Math.round(f.suggestScale * 1000) / 1000) })
 }
+
+const calibrationTag = computed(() => {
+  const p = project.value
+  if (!p) return null
+  const c = store.calibrationOfProject(p)
+  if (!c) return null
+  return `${c.machine} · ${c.paperLabel}（sₓ ${c.current.sx.toFixed(4)} / s_y ${c.current.sy.toFixed(4)}）`
+})
 
 // ---------------- 顺序表 ----------------
 const steps = computed<JobStep[]>(() => job.value?.steps ?? [])
@@ -301,6 +326,12 @@ const boundsInfo = computed(() => {
           {{ fitInfo.availW.toFixed(0) }}×{{ fitInfo.availH.toFixed(0) }}mm，可直接自动缩放排版。
           <button class="tiny" @click="autoFit">自动缩放至适配（{{ (fitInfo.suggestScale * 100).toFixed(0) }}%）</button>
         </div>
+        <div v-else-if="calibrationTag && fitInfo && !fitInfo.compFits" class="banner err">
+          设计尺寸放得下，但按当前校准档案补偿后下发范围为 {{ fitInfo.compW.toFixed(0) }}×{{ fitInfo.compH.toFixed(0) }}mm，超出纸幅——请缩小或到校准页检查档案。
+        </div>
+        <div v-else-if="calibrationTag" class="banner ok">
+          已按校准档案预补偿：补偿后下发 {{ fitInfo?.compW.toFixed(0) }}×{{ fitInfo?.compH.toFixed(0) }}mm，在纸幅内。
+        </div>
 
         <div class="section">
           <div class="section-title">
@@ -519,6 +550,26 @@ const boundsInfo = computed(() => {
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
+}
+
+.banner.err {
+  background: rgba(255, 107, 107, 0.1);
+  border: 1px solid rgba(255, 107, 107, 0.4);
+  color: #ffb3b3;
+  padding: 7px 9px;
+  border-radius: 6px;
+  margin-bottom: 8px;
+  font-size: 12px;
+}
+
+.banner.ok {
+  background: rgba(71, 192, 122, 0.1);
+  border: 1px solid rgba(71, 192, 122, 0.35);
+  color: #9fe0b8;
+  padding: 7px 9px;
+  border-radius: 6px;
+  margin-bottom: 8px;
+  font-size: 12px;
 }
 
 .check {
